@@ -356,6 +356,172 @@ void gather_qmv(
   });
 }
 
+// ---------------------------------------------------------------------------
+// gather_qmm_tiled_kernel - Tiled GEMM for large M
+// ---------------------------------------------------------------------------
+template<
+    int TILE_M, int TILE_N, int TILE_K, int VEC_SIZE,
+    int group_size, bool has_bias,
+    typename T, typename Q, typename S>
+__global__ void gather_qmm_tiled_kernel(
+    const T* __restrict__ x,
+    const Q* __restrict__ w,
+    const S* __restrict__ scales,
+    const T* __restrict__ biases,
+    const uint32_t* __restrict__ lhs_indices,
+    const uint32_t* __restrict__ rhs_indices,
+    T* __restrict__ out,
+    int M, int N, int K, int batch_size) {
+  int n_start = blockIdx.x * TILE_N;
+  int m_start = blockIdx.y * TILE_M;
+  int batch_idx = blockIdx.z;
+
+  uint32_t lhs_idx = lhs_indices[batch_idx];
+  uint32_t rhs_idx = rhs_indices[batch_idx];
+
+  const T* x_base = x + static_cast<int64_t>(lhs_idx) * M * K;
+  T* out_base = out + static_cast<int64_t>(batch_idx) * M * N;
+
+  constexpr int bits = cute::sizeof_bits_v<Q>;
+  auto w_step = [](int idx) -> int { return idx * cuda::std::min(8, bits) / 8; };
+
+  int groups_per_row = K / group_size;
+  const Q* w_base = w + static_cast<int64_t>(rhs_idx) * N * w_step(K);
+  const S* scales_base = scales + static_cast<int64_t>(rhs_idx) * N * groups_per_row;
+  const T* biases_base = nullptr;
+  if constexpr (has_bias) {
+    biases_base = biases + static_cast<int64_t>(rhs_idx) * N * groups_per_row;
+  }
+
+  extern __shared__ char shared_mem[];
+  T* smem_x = reinterpret_cast<T*>(shared_mem);
+  T* smem_w = smem_x + TILE_M * TILE_K;
+
+  constexpr int THREADS_N = TILE_N / 4;
+  constexpr int NUM_THREADS = TILE_M * THREADS_N;
+  int tid = threadIdx.x;
+  int thread_m = tid / THREADS_N;
+  int thread_n = (tid % THREADS_N) * 4;
+
+  float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  int k_tiles = (K + TILE_K - 1) / TILE_K;
+  for (int kt = 0; kt < k_tiles; ++kt) {
+    int k_start = kt * TILE_K;
+    int k_len = min(TILE_K, K - k_start);
+
+    // Load X tile
+    {
+      int total_x = TILE_M * TILE_K;
+      for (int idx = tid; idx < total_x; idx += NUM_THREADS) {
+        int row = idx / TILE_K;
+        int col = idx % TILE_K;
+        int gm = m_start + row;
+        int gk = k_start + col;
+        smem_x[row * TILE_K + col] =
+            (gm < M && col < k_len) ? x_base[gm * K + gk] : T(0);
+      }
+    }
+
+    // Load & dequantize W tile
+    {
+      constexpr int qbits = cute::sizeof_bits_v<Q>;
+      int total_w = TILE_N * TILE_K;
+      for (int idx = tid; idx < total_w; idx += NUM_THREADS) {
+        int row_n = idx / TILE_K;
+        int col_k = idx % TILE_K;
+        int gn = n_start + row_n;
+        int gk = k_start + col_k;
+        if (gn < N && col_k < k_len) {
+          int gi = gk / group_size;
+          S scale = scales_base[gn * groups_per_row + gi];
+
+          // Bit-level extraction for any sub-byte or byte quantized type.
+          int64_t bit_idx = static_cast<int64_t>(gn) * K + gk;
+          const uint8_t* raw_base = reinterpret_cast<const uint8_t*>(w_base);
+          int64_t byte_pos = bit_idx * qbits / 8;
+          int bit_offset = (bit_idx * qbits) % 8;
+          uint8_t mask = static_cast<uint8_t>((1u << qbits) - 1u);
+
+          uint16_t twobytes;
+          if constexpr (qbits <= 8) {
+            // Read up to 2 bytes to handle cross-byte boundaries.
+            twobytes = raw_base[byte_pos];
+            if (bit_offset + qbits > 8) {
+              twobytes |= static_cast<uint16_t>(raw_base[byte_pos + 1]) << 8;
+            }
+          }
+          T val = T(int((twobytes >> bit_offset) & mask)) * T(scale);
+          if constexpr (has_bias) {
+            val = val + biases_base[gn * groups_per_row + gi];
+          }
+          smem_w[row_n * TILE_K + col_k] = val;
+        } else {
+          smem_w[row_n * TILE_K + col_k] = T(0);
+        }
+      }
+    }
+
+    __syncthreads();
+
+    if (thread_m < TILE_M && (m_start + thread_m) < M) {
+      const T* my_x = smem_x + thread_m * TILE_K;
+#pragma unroll 8
+      for (int kk = 0; kk < k_len; ++kk) {
+        float xv = float(my_x[kk]);
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+          accum[ni] += xv * float(smem_w[(thread_n + ni) * TILE_K + kk]);
+        }
+      }
+    }
+    __syncthreads();
+  }
+
+  if (thread_m < TILE_M && (m_start + thread_m) < M) {
+    int gm = m_start + thread_m;
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      int gn = n_start + thread_n + ni;
+      if (gn < N) {
+        out_base[gm * N + gn] = T(accum[ni]);
+      }
+    }
+  }
+}
+
+template <int group_size, bool has_bias,
+          typename T, typename Q, typename S, typename F>
+void gather_qmm_tiled(
+    const T* x, const Q* w, const S* scales, const T* biases,
+    const uint32_t* lhs_indices, const uint32_t* rhs_indices,
+    T* out, int m, int n, int k, int batch_size,
+    F&& launch_kernel) {
+  constexpr int TILE_M = 32;
+  constexpr int TILE_N = 64;
+  constexpr int TILE_K = 64;
+  constexpr int VEC_SIZE = 8;
+  constexpr int NUM_THREADS = TILE_M * (TILE_N / 4);
+  size_t smem_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(T);
+
+  dim3 num_blocks{
+      uint32_t(cuda::ceil_div(n, TILE_N)),
+      uint32_t(cuda::ceil_div(m, TILE_M)),
+      uint32_t(batch_size)};
+  dim3 block_dims{NUM_THREADS};
+  void* args[] = {
+      &x, &w, &scales, &biases,
+      &lhs_indices, &rhs_indices, &out,
+      &m, &n, &k, &batch_size};
+
+  auto* kernel = &gather_qmm_tiled_kernel<
+      TILE_M, TILE_N, TILE_K, VEC_SIZE,
+      group_size, has_bias, T, Q, S>;
+
+  launch_kernel(reinterpret_cast<void*>(kernel),
+                num_blocks, block_dims, smem_bytes, args);
+}
+
 } // namespace cu
 
 // ---------------------------------------------------------------------------
@@ -388,6 +554,9 @@ void gather_qmm(
   // e.g. indices shape [1, 1, 8] -> batch_size = 8
   int batch_size = lhs_indices.size();
 
+  // For M > 4, use tiled GEMM kernel for better performance.
+  bool use_tiled = (M > 4);
+
   dispatch_element_types(out.dtype(), tag, [&]<typename T>() {
     dispatch_groups(group_size_, tag, [&]<int group_size>() {
       auto dispatch_bits = [&]<typename Q>() {
@@ -402,25 +571,53 @@ void gather_qmm(
         enc.set_input_array(rhs_indices);
         enc.set_output_array(out);
 
-        cu::gather_qmv<group_size, has_bias>(
-            gpu_ptr<T>(x),
-            gpu_ptr<Q>(w),
-            gpu_ptr<S>(scales),
-            gpu_ptr<T>(biases),
-            gpu_ptr<uint32_t>(lhs_indices),
-            gpu_ptr<uint32_t>(rhs_indices),
-            gpu_ptr<T>(out),
-            M,
-            N,
-            K,
-            batch_size,
-            [&](auto* kernel,
-                dim3 num_blocks,
-                dim3 block_dims,
-                void** args) {
-              enc.add_kernel_node_raw(
-                  kernel, num_blocks, block_dims, {}, 0, args);
-            });
+        if (use_tiled) {
+          // Tiled GEMM path: W is loaded into shared memory once and
+          // reused across TILE_M rows of X, greatly reducing global
+          // memory bandwidth for large M.
+          cu::gather_qmm_tiled<group_size, has_bias>(
+              gpu_ptr<T>(x),
+              gpu_ptr<Q>(w),
+              gpu_ptr<S>(scales),
+              gpu_ptr<T>(biases),
+              gpu_ptr<uint32_t>(lhs_indices),
+              gpu_ptr<uint32_t>(rhs_indices),
+              gpu_ptr<T>(out),
+              M,
+              N,
+              K,
+              batch_size,
+              [&](auto* kernel,
+                  dim3 num_blocks,
+                  dim3 block_dims,
+                  uint32_t smem_bytes,
+                  void** args) {
+                enc.add_kernel_node_raw(
+                    kernel, num_blocks, block_dims, {}, smem_bytes, args);
+              });
+        } else {
+          // Original matvec path: optimal for M <= 4 where each warp
+          // computes one dot product along K.
+          cu::gather_qmv<group_size, has_bias>(
+              gpu_ptr<T>(x),
+              gpu_ptr<Q>(w),
+              gpu_ptr<S>(scales),
+              gpu_ptr<T>(biases),
+              gpu_ptr<uint32_t>(lhs_indices),
+              gpu_ptr<uint32_t>(rhs_indices),
+              gpu_ptr<T>(out),
+              M,
+              N,
+              K,
+              batch_size,
+              [&](auto* kernel,
+                  dim3 num_blocks,
+                  dim3 block_dims,
+                  void** args) {
+                enc.add_kernel_node_raw(
+                    kernel, num_blocks, block_dims, {}, 0, args);
+              });
+        }
       };
 
       if (bits_ == 2) {
@@ -442,5 +639,6 @@ void gather_qmm(
     });
   });
 }
+
 
 } // namespace mlx::core
