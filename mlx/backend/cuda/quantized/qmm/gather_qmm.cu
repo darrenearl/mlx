@@ -192,8 +192,11 @@ dequant_fma(const T* x, const Q* w, S scale, T bias, float* out) {
 // rhs_indices:  [batch_size] (flattened)  -- index into w's expert dim
 // out layout:   [batch_size, M, N]        (flattened output batch)
 //
-// Grid: {ceil_div(N, rows_per_block), M, batch_size}
+// Grid: {ceil_div(N, rows_per_block) * batch_size, M, 1}
 // Block: {WARP_SIZE, rows_per_block}
+//
+// NOTE: batch_size is folded into grid.x (instead of grid.z) to avoid
+// the 65535 limit on grid.z/grid.y when batch_size >= 65536.
 // ---------------------------------------------------------------------------
 template <
     int rows_per_block,
@@ -215,17 +218,21 @@ __global__ void gather_qmv_kernel(
     int n,
     int k,
     int batch_size) {
-  auto grid = cg::this_grid();
   auto block = cg::this_thread_block();
   auto warp = cg::tiled_partition<WARP_SIZE>(block);
 
-  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
+  // Decode batch_idx and row from blockIdx.x
+  // grid.x = n_blocks_per_batch * batch_size
+  int n_blocks_per_batch = cuda::ceil_div(n, rows_per_block);
+  int batch_idx = block.group_index().x / n_blocks_per_batch;
+  int row = (block.group_index().x % n_blocks_per_batch) * rows_per_block
+            + warp.meta_group_rank();
+
   if (row >= n) {
     return;
   }
 
-  int m = grid.dim_blocks().y;
-  int batch_idx = block.group_index().z;
+  int m = gridDim.y;
 
   // Gather indices.
   uint32_t lhs_idx = lhs_indices[batch_idx];
@@ -324,10 +331,14 @@ void gather_qmv(
   constexpr int elems_per_thread =
       (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
 
+  // Fold batch_size into grid.x to avoid the 65535 limit on grid.z.
+  // grid.x = ceil_div(n, rows_per_block) * batch_size
+  // Kernel decodes: batch_idx = blockIdx.x / n_blocks_per_batch
+  //                 block_n   = blockIdx.x % n_blocks_per_batch
   dim3 num_blocks{
-      uint32_t(cuda::ceil_div(n, rows_per_block)),
+      uint32_t(cuda::ceil_div(n, rows_per_block)) * uint32_t(batch_size),
       uint32_t(m),
-      uint32_t(batch_size)};
+      1};
   dim3 block_dims{WARP_SIZE, rows_per_block};
   void* args[] = {
       &x,
@@ -372,9 +383,12 @@ __global__ void gather_qmm_tiled_kernel(
     const uint32_t* __restrict__ rhs_indices,
     T* __restrict__ out,
     int M, int N, int K, int batch_size) {
-  int n_start = blockIdx.x * TILE_N;
+  // Decode batch_idx and n_start from blockIdx.x
+  // grid.x = n_blocks_per_batch * batch_size
+  int n_blocks_per_batch = (N + TILE_N - 1) / TILE_N;
+  int batch_idx = blockIdx.x / n_blocks_per_batch;
+  int n_start = (blockIdx.x % n_blocks_per_batch) * TILE_N;
   int m_start = blockIdx.y * TILE_M;
-  int batch_idx = blockIdx.z;
 
   uint32_t lhs_idx = lhs_indices[batch_idx];
   uint32_t rhs_idx = rhs_indices[batch_idx];
@@ -504,10 +518,15 @@ void gather_qmm_tiled(
   constexpr int NUM_THREADS = TILE_M * (TILE_N / 4);
   size_t smem_bytes = (TILE_M * TILE_K + TILE_N * TILE_K) * sizeof(T);
 
+  // Fold batch_size into grid.x to avoid the 65535 limit on grid.z.
+  // grid.x = n_blocks_per_batch * batch_size
+  // Kernel decodes: batch_idx = blockIdx.x / n_blocks_per_batch
+  //                 block_n   = blockIdx.x % n_blocks_per_batch
+  uint32_t n_blocks_per_batch = uint32_t(cuda::ceil_div(n, TILE_N));
   dim3 num_blocks{
-      uint32_t(cuda::ceil_div(n, TILE_N)),
+      n_blocks_per_batch * uint32_t(batch_size),
       uint32_t(cuda::ceil_div(m, TILE_M)),
-      uint32_t(batch_size)};
+      1};
   dim3 block_dims{NUM_THREADS};
   void* args[] = {
       &x, &w, &scales, &biases,
