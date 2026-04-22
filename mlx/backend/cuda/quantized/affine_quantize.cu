@@ -20,10 +20,10 @@ affine_quantize(const T* w, uint8_t* out, T* scales, T* biases, size_t size) {
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
 
-  int64_t tidx = block_idx.x * block_size.x + idx_in_block.x;
-  int64_t tidy = block_idx.y * block_size.y + idx_in_block.y;
+  auto tidx = block_idx.x * block_size.x + idx_in_block.x;
+  auto tidy = block_idx.y * block_size.y + idx_in_block.y;
 
-  int64_t grid_dim_x = cg::this_grid().dim_blocks().x * block_size.x;
+  auto grid_dim_x = cg::this_grid().dim_blocks().x * block_size.x;
   constexpr float eps = 1e-7;
   constexpr int simd_size = WARP_SIZE;
   constexpr float n_bins = (1 << bits) - 1;
@@ -137,10 +137,10 @@ __global__ void affine_dequantize(
   auto block_idx = cg::this_thread_block().group_index();
   auto idx_in_block = cg::this_thread_block().thread_index();
 
-  int64_t tidx = block_idx.x * block_size.x + idx_in_block.x;
-  int64_t tidy = block_idx.y * block_size.y + idx_in_block.y;
+  auto tidx = block_idx.x * block_size.x + idx_in_block.x;
+  auto tidy = block_idx.y * block_size.y + idx_in_block.y;
 
-  int64_t grid_dim_x = cg::this_grid().dim_blocks().x * block_size.x;
+  auto grid_dim_x = cg::this_grid().dim_blocks().x * block_size.x;
 
   constexpr int pack_factor = get_pack_factor(bits, 8);
   constexpr int bytes_per_pack = get_bytes_per_pack(bits);
