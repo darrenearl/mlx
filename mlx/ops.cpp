@@ -4515,6 +4515,12 @@ array quantized_matmul(
 
   if (x.ndim() > 2 && w.ndim() > 2) {
     inputs = broadcast_arrays(inputs, {-2, -1}, s);
+    // Fix the 5D mm bug
+    if (inputs[0].ndim() > 3) {
+      for (size_t i = 0; i < inputs.size(); ++i) {
+        inputs[i] = contiguous(inputs[i], /*allow_col_major=*/false, s);
+      }
+    }
   }
   auto out_shape = inputs[0].shape();
   out_shape.back() = w_outer_dims;
